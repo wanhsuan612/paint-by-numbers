@@ -40,35 +40,34 @@ Allowed simplifications: {allowed_changes}.
     stages = [
         StagePrompt(
             stage="A",
-            purpose="Isolate the run-specific subjects and simplify them into a flat paint-by-numbers subject layer.",
+            purpose="Isolate the run-specific subjects and redraw them as a flat coloring-book illustration for the subject layer.",
             required_inputs=["source image"],
             pass_conditions=[
                 "Every subject named in the run specification is present exactly once, with no added subject.",
                 "Subject count, identity, silhouette, pose or orientation, action, relative arrangement, and dominant colors match the source and run-specific preservation rules.",
-                "Nonessential texture and repeated detail are replaced by large, smooth, closed, nearly uniform color regions.",
-                "The background is one uniform solid #FF00FF field, clearly separated from every subject.",
+                "The rendering reads as a flat, hand-drawn coloring-book illustration: bold clean outlines and large closed color regions, with no gradients, brush or paint texture, or photographic detail.",
+                "The background is one uniform vivid magenta field, clearly separated from every subject, with no shadow, texture, or scenery.",
             ],
             prompt=f"""
 GOAL
-Create one flat subject layer for a beginner paint-by-numbers workflow. This is a structural color plan, not a
-finished illustration or oil painting.
+Redraw the run-specific subjects below as a flat coloring-book illustration: bold clean outlines, large closed
+color regions, no gradients, no brush or paint texture, no photographic shading. This is a structural color plan
+for a beginner paint-by-numbers kit, not a finished painting or photo.
 
-CONTENT
-Keep only these run-specific subjects: {subjects}. Preserve their count, identity, silhouette, pose or orientation,
-action, relative arrangement, dominant colors, and only the recognition-critical features named here:
-{preservation_rules}.
+RUN SCOPE
+Subjects to keep: {subjects}.
+Preserve exactly: {preservation_rules}.
+Allowed simplification: {allowed_changes}.
 
-SIMPLIFICATION
-Apply these allowed changes: {allowed_changes}. Replace nonessential texture and repeated detail with a small
-number of large, smooth, closed, nearly uniform color regions. Keep a small detail only when the run-specific
-preservation rules make it essential for recognition. Do not add decorative detail, visible brushwork, gradients,
-speckles, thin repeated marks, or fragmented color patches.
+TRANSFORM
+Redraw every subject in the coloring-book style above. Anything not covered by "Preserve exactly" is free to
+simplify: flatten fine texture, merge repeated small patterns, and reduce color variation into a small number of
+large regions. Keep a detail only when "Preserve exactly" requires it.
 
 BACKGROUND
-Replace everything outside the subjects with one perfectly uniform solid #FF00FF background. Do not place
-#FF00FF inside a subject. Do not add scenery, cast shadows, text, borders, line art, numbers, or a palette.
-
-{run_context}
+Fill everything outside the subjects with one uniform vivid magenta field (a saturated pink-purple, distinct from
+every subject color), with no scenery, shadow, texture, text, borders, line-art numbers, or palette. Keep magenta
+strictly outside the subjects.
 """.strip(),
         ),
         StagePrompt(

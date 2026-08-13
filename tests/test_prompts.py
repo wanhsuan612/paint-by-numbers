@@ -11,7 +11,8 @@ def test_default_plan_contains_exactly_a_to_e() -> None:
     plan = build_default_plan(WorkflowSpec())
     assert [stage.stage for stage in plan.stages] == ["A", "B", "C", "D", "E"]
     assert "36" in plan.stage("E").prompt
-    assert "not a\nfinished illustration or oil painting" in plan.stage("A").prompt.lower()
+    assert "not a finished painting or photo" in plan.stage("A").prompt.lower()
+    assert "coloring-book illustration" in plan.stage("A").prompt.lower()
     assert "three cats" not in plan.model_dump_json().lower()
     assert "yarn" not in plan.model_dump_json().lower()
 
