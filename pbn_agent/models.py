@@ -60,6 +60,7 @@ class WorkflowSpec(BaseModel):
     max_revisions_per_stage: int = 2
     approval_stages: list[StageName] = Field(default_factory=lambda: ["C", "E"])
     minimum_number_height_mm: float = 3.0
+    minimum_region_width_mm: float = 1.5
     canvas: CanvasSpec = Field(default_factory=CanvasSpec)
     forced_palette_colors: list[tuple[int, int, int]] = Field(
         default_factory=lambda: [(248, 245, 235), (28, 23, 18)]

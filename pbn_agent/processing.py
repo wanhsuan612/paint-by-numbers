@@ -52,21 +52,39 @@ def _auto_protect_highlights(rgb: np.ndarray) -> np.ndarray:
     count, components, stats, _ = cv2.connectedComponentsWithStats(candidates, 8)
     protected = np.zeros_like(candidates)
     max_area = max(12, round(rgb.shape[0] * rgb.shape[1] * 0.00008))
+    inner_kernel = np.ones((5, 5), dtype=np.uint8)
+    outer_kernel = np.ones((11, 11), dtype=np.uint8)
     for component_id in range(1, count):
         area = int(stats[component_id, cv2.CC_STAT_AREA])
-        if 1 <= area <= max_area:
-            protected[components == component_id] = 1
+        if not 1 <= area <= max_area:
+            continue
+        x, y, width, height = (int(value) for value in stats[component_id, :4])
+        left, top = max(0, x - 6), max(0, y - 6)
+        right, bottom = min(rgb.shape[1], x + width + 6), min(rgb.shape[0], y + height + 6)
+        component = (components[top:bottom, left:right] == component_id).astype(np.uint8)
+        # Ring just outside the anti-aliased edge of the highlight.
+        ring = cv2.dilate(component, outer_kernel).astype(bool) & ~cv2.dilate(component, inner_kernel).astype(bool)
+        surroundings = gray[top:bottom, left:right][ring]
+        # A catchlight sits in a dark pupil or mid-tone iris on every side; bright fur edges
+        # always have light fur or background on one side.
+        if (surroundings < 205).mean() >= 0.8 and (surroundings <= 135).mean() >= 0.3:
+            protected[top:bottom, left:right][component.astype(bool)] = 1
     return protected.astype(bool)
 
 
-def _prepare_mask(mask_path: Path | None, source_shape: tuple[int, int], aspect: float, width: int) -> np.ndarray:
+def _prepare_mask(
+    mask_path: Path | None,
+    source_shape: tuple[int, int],
+    aspect: float,
+    working_shape: tuple[int, int],
+) -> np.ndarray:
     if mask_path is None:
-        return np.zeros((round(width / aspect), width), dtype=bool)
+        return np.zeros(working_shape, dtype=bool)
     mask = np.asarray(Image.open(mask_path).convert("L"))
     if mask.shape != source_shape:
         mask = cv2.resize(mask, (source_shape[1], source_shape[0]), interpolation=cv2.INTER_NEAREST)
     mask = _center_crop_to_aspect(mask, aspect)
-    mask = _resize_working(mask, width, cv2.INTER_NEAREST)
+    mask = cv2.resize(mask, (working_shape[1], working_shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask >= 128
 
 
@@ -164,6 +182,7 @@ def _merge_small_components(
     palette: np.ndarray,
     minimum_area: int,
     protected: np.ndarray,
+    minimum_radius: float = 0.0,
     passes: int = 3,
 ) -> np.ndarray:
     merged = labels.copy()
@@ -176,13 +195,17 @@ def _merge_small_components(
             )
             for component_id in range(1, count):
                 area = int(stats[component_id, cv2.CC_STAT_AREA])
-                if area >= minimum_area:
-                    continue
                 x = int(stats[component_id, cv2.CC_STAT_LEFT])
                 y = int(stats[component_id, cv2.CC_STAT_TOP])
                 width = int(stats[component_id, cv2.CC_STAT_WIDTH])
                 height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
                 component_roi = components[y : y + height, x : x + width] == component_id
+                if area >= minimum_area:
+                    if minimum_radius <= 0:
+                        continue
+                    padded = np.pad(component_roi.astype(np.uint8), 1)
+                    if cv2.distanceTransform(padded, cv2.DIST_L2, 5).max() >= minimum_radius:
+                        continue
                 if np.any(protected[y : y + height, x : x + width] & component_roi):
                     continue
                 left = max(0, x - 1)
@@ -205,11 +228,37 @@ def _merge_small_components(
     return merged
 
 
-def _boundary_image(labels: np.ndarray) -> np.ndarray:
+def _smooth_labels(
+    labels: np.ndarray,
+    protected: np.ndarray,
+    sigma: float,
+    output_size: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Replace stair-stepped label edges with smooth curves; protected pixels keep their label."""
+    width, height = output_size or (labels.shape[1], labels.shape[0])
+    best_score = np.full((height, width), -1.0, dtype=np.float32)
+    smoothed = np.zeros((height, width), dtype=labels.dtype)
+    for label in np.unique(labels):
+        score = cv2.GaussianBlur((labels == label).astype(np.float32), (0, 0), sigma)
+        if output_size is not None:
+            score = cv2.resize(score, output_size, interpolation=cv2.INTER_LINEAR)
+        better = score > best_score
+        best_score[better] = score[better]
+        smoothed[better] = label
+    if output_size is None:
+        smoothed[protected] = labels[protected]
+    else:
+        keep = cv2.resize(protected.astype(np.uint8), output_size, interpolation=cv2.INTER_NEAREST).astype(bool)
+        nearest = cv2.resize(labels, output_size, interpolation=cv2.INTER_NEAREST)
+        smoothed[keep] = nearest[keep]
+    return smoothed
+
+
+def _boundary_image(labels: np.ndarray, line_width: int = 2) -> np.ndarray:
     boundary = np.zeros(labels.shape, dtype=bool)
     boundary[:, 1:] |= labels[:, 1:] != labels[:, :-1]
     boundary[1:, :] |= labels[1:, :] != labels[:-1, :]
-    boundary = cv2.dilate(boundary.astype(np.uint8), np.ones((2, 2), np.uint8)).astype(bool)
+    boundary = cv2.dilate(boundary.astype(np.uint8), np.ones((line_width, line_width), np.uint8)).astype(bool)
     line_art = np.full(labels.shape, 255, dtype=np.uint8)
     line_art[boundary] = 0
     return line_art
@@ -358,7 +407,7 @@ def create_paint_by_numbers(
         protected_mask_path,
         source.shape[:2],
         spec.canvas.aspect_ratio,
-        spec.canvas.working_width_px,
+        working.shape[:2],
     )
     auto_protected = _auto_protect_highlights(working)
     protected = manual_protected | auto_protected
@@ -380,14 +429,16 @@ def create_paint_by_numbers(
     number_height_final = round(spec.minimum_number_height_mm / 25.4 * spec.canvas.dpi)
     number_height_working = max(4, round(number_height_final / final_scale))
     minimum_area = max(24, round(number_height_working * number_height_working * 1.8))
-    labels = _merge_small_components(labels, palette, minimum_area, protected)
+    minimum_radius = spec.minimum_region_width_mm / 2 / 25.4 * spec.canvas.dpi / final_scale
+    labels = _smooth_labels(labels, protected, sigma=1.5)
+    labels = _merge_small_components(labels, palette, minimum_area, protected, minimum_radius)
 
-    quantized = palette[labels]
     counts = np.bincount(labels.reshape(-1), minlength=len(palette))
     output_size = (spec.canvas.output_width_px, spec.canvas.output_height_px)
-    preview_final = cv2.resize(quantized, output_size, interpolation=cv2.INTER_NEAREST)
-    line_working = _boundary_image(labels)
-    blank_final = cv2.resize(line_working, output_size, interpolation=cv2.INTER_NEAREST)
+    labels_final = _smooth_labels(labels, protected, sigma=1.0, output_size=output_size)
+    preview_final = palette[labels_final]
+    line_width = max(2, round(0.25 / 25.4 * spec.canvas.dpi))
+    blank_final = _boundary_image(labels_final, line_width)
     numbered, report = _draw_labels(
         blank_final,
         labels,
