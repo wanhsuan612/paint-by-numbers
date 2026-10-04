@@ -8,3 +8,4 @@ dist/
 output/
 
 .DS_Store
+samples/private/
