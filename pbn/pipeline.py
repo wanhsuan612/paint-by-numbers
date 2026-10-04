@@ -18,7 +18,10 @@ class Params:
     min_region_frac: float = 0.0004  # smallest region, as a fraction of image area
     smooth_borders: int = 7  # majority-filter window for ragged color borders; 0 disables
     protect_delta_e: float = 35.0  # small regions this different from their surroundings are kept...
-    protect_min_frac: float = 0.00003  # ...unless smaller than this fraction of image area
+    protect_min_frac: float = 0.00002  # ...unless smaller than this fraction of image area
+    rescue_colors: int = 4  # palette slots that may be handed to colors K-means missed
+    rescue_delta_e: float = 9.0  # a pixel this far from every palette color is badly matched...
+    rescue_min_frac: float = 0.0002  # ...and a connected patch of them this large earns its own color
     seed: int = 0
 
 
@@ -48,23 +51,72 @@ def smooth(rgb: np.ndarray, p: Params) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def to_lab(rgb: np.ndarray) -> np.ndarray:
+    """RGB uint8 to true CIELAB (L 0-100), so differences read as Delta E."""
+    return cv2.cvtColor(rgb.astype(np.float32) / 255, cv2.COLOR_RGB2LAB)
+
+
+def lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    rgb = cv2.cvtColor(lab[None].astype(np.float32), cv2.COLOR_LAB2RGB)[0]
+    return np.clip(np.round(rgb * 255), 0, 255).astype(np.uint8)
+
+
+def assign(lab: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest center for each Lab pixel, and the Delta E to it."""
+    d2 = (lab**2).sum(axis=1)[:, None] - 2 * lab @ centers.T + (centers**2).sum(axis=1)[None, :]
+    labels = d2.argmin(axis=1)
+    return labels.astype(np.int32), np.sqrt(np.maximum(d2[np.arange(len(lab)), labels], 0))
+
+
 def quantize(rgb: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray]:
-    """K-means in Lab so color distances match perception. Returns (palette RGB, labels)."""
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    """K-means in Lab, then rescue colors it missed. Returns (palette RGB, labels).
+
+    K-means spends its colors where the pixels are, so a small but distinctive area (a pink nose,
+    green eyes) can end up with no color close to it. Each rescue finds the largest connected patch
+    that every palette color matches badly, merges the two most similar palette colors to free a
+    slot, and gives the patch its own color.
+    """
+    h, w = rgb.shape[:2]
+    lab = to_lab(rgb).reshape(-1, 3)
     rng = np.random.default_rng(p.seed)
     sample = lab[rng.choice(len(lab), size=min(len(lab), 60_000), replace=False)]
     cv2.setRNGSeed(p.seed)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
     _, _, centers = cv2.kmeans(sample, p.n_colors, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
-    dists = (centers**2).sum(axis=1)[None, :] - 2 * lab @ centers.T
-    labels = dists.argmin(axis=1).reshape(rgb.shape[:2])
-    palette = cv2.cvtColor(centers.astype(np.uint8)[None], cv2.COLOR_LAB2RGB)[0]
-    return palette, labels.astype(np.int32)
+
+    rescue_area = p.rescue_min_frac * h * w
+    rescued: list[int] = []
+    for _ in range(p.rescue_colors):
+        labels, err = assign(lab, centers)
+        patches, _ = ndimage.label((err > p.rescue_delta_e).reshape(h, w))
+        areas = np.bincount(patches.ravel())
+        areas[0] = 0
+        color = None
+        for candidate in np.argsort(-areas):
+            if areas[candidate] < rescue_area:
+                break
+            mean = lab[patches.ravel() == candidate].mean(axis=0)
+            # Skip a patch whose average is already in the palette; only its spread is off.
+            if np.linalg.norm(centers - mean, axis=1).min() >= p.rescue_delta_e:
+                color = mean
+                break
+        if color is None:
+            break
+        counts = np.bincount(labels, minlength=len(centers)).astype(np.float32)
+        gaps = np.linalg.norm(centers[:, None] - centers[None], axis=2)
+        np.fill_diagonal(gaps, np.inf)
+        gaps[rescued, :] = gaps[:, rescued] = np.inf  # never merge away a color we just rescued
+        i, j = np.unravel_index(gaps.argmin(), gaps.shape)
+        centers[i] = (centers[i] * counts[i] + centers[j] * counts[j]) / max(counts[i] + counts[j], 1)
+        centers[j] = color
+        rescued.append(int(j))
+
+    labels, _ = assign(lab, centers)
+    return lab_to_rgb(centers), labels.reshape(h, w)
 
 
 def palette_lab(palette: np.ndarray) -> np.ndarray:
-    """Palette in true CIELAB (L 0-100), so differences read as Delta E."""
-    return cv2.cvtColor(palette[None].astype(np.float32) / 255, cv2.COLOR_RGB2LAB)[0]
+    return to_lab(palette[None])[0]
 
 
 def majority_filter(labels: np.ndarray, n_colors: int, size: int) -> np.ndarray:
@@ -73,6 +125,20 @@ def majority_filter(labels: np.ndarray, n_colors: int, size: int) -> np.ndarray:
         [cv2.boxFilter((labels == c).astype(np.float32), -1, (size, size)) for c in range(n_colors)]
     )
     return votes.argmax(axis=0).astype(np.int32)
+
+
+def restore_details(
+    before: np.ndarray, after: np.ndarray, palette: np.ndarray, min_area: int, delta_e: float
+) -> np.ndarray:
+    """Undo the majority filter where it erased a small patch of sharply different color, like a catchlight."""
+    lab_palette = palette_lab(palette)
+    erased = np.linalg.norm(lab_palette[before] - lab_palette[after], axis=-1) >= delta_e
+    patches, _ = ndimage.label(erased)
+    areas = np.bincount(patches.ravel())
+    keep = (areas >= min_area)[patches] & erased
+    restored = after.copy()
+    restored[keep] = before[keep]
+    return restored
 
 
 def label_regions(labels: np.ndarray) -> tuple[np.ndarray, int]:
@@ -156,9 +222,10 @@ def run(rgb: np.ndarray, p: Params | None = None) -> Result:
     palette, labels = quantize(smoothed, p)
     _, raw_count = label_regions(labels)
     min_area = max(4, round(p.min_region_frac * labels.size))
-    if p.smooth_borders:
-        labels = majority_filter(labels, len(palette), p.smooth_borders)
     protect_area = max(4, round(p.protect_min_frac * labels.size))
+    if p.smooth_borders:
+        filtered = majority_filter(labels, len(palette), p.smooth_borders)
+        labels = restore_details(labels, filtered, palette, protect_area, p.protect_delta_e)
     labels = merge_small_regions(labels, palette, min_area, protect_area, p.protect_delta_e)
     palette, labels = compact_palette(labels, palette)
     regions, count = label_regions(labels)
