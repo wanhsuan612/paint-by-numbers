@@ -19,6 +19,7 @@ class Params:
     smooth_borders: int = 7  # majority-filter window for ragged color borders; 0 disables
     protect_delta_e: float = 35.0  # small regions this different from their surroundings are kept...
     protect_min_frac: float = 0.00002  # ...unless smaller than this fraction of image area
+    min_color_gap: float = 10.0  # palette colors closer than this Delta E are merged, so gradients band less
     rescue_colors: int = 4  # palette slots that may be handed to colors K-means missed
     rescue_delta_e: float = 9.0  # a pixel this far from every palette color is badly matched...
     rescue_min_frac: float = 0.0002  # ...and a connected patch of them this large earns its own color
@@ -68,13 +69,29 @@ def assign(lab: np.ndarray, centers: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return labels.astype(np.int32), np.sqrt(np.maximum(d2[np.arange(len(lab)), labels], 0))
 
 
-def quantize(rgb: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray]:
-    """K-means in Lab, then rescue colors it missed. Returns (palette RGB, labels).
+def merge_closest_pair(centers: np.ndarray, counts: np.ndarray, frozen: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Replace the two most similar unfrozen colors with their pixel-weighted mean."""
+    gaps = np.linalg.norm(centers[:, None] - centers[None], axis=2)
+    np.fill_diagonal(gaps, np.inf)
+    gaps[frozen, :] = gaps[:, frozen] = np.inf
+    i, j = np.unravel_index(gaps.argmin(), gaps.shape)
+    total = counts[i] + counts[j]
+    centers[i] = (centers[i] * counts[i] + centers[j] * counts[j]) / max(total, 1)
+    counts[i] = total
+    keep = np.arange(len(centers)) != j
+    return centers[keep], counts[keep], frozen[keep], float(gaps[i, j])
 
-    K-means spends its colors where the pixels are, so a small but distinctive area (a pink nose,
-    green eyes) can end up with no color close to it. Each rescue finds the largest connected patch
-    that every palette color matches badly, merges the two most similar palette colors to free a
-    slot, and gives the patch its own color.
+
+def quantize(rgb: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray]:
+    """K-means in Lab, then space the colors out and rescue colors it missed. Returns (palette RGB, labels).
+
+    K-means spends its colors where the pixels are. A large smooth gradient (a white chest, a plate)
+    soaks up a ramp of near-identical colors, which paints as many thin contour bands; merging colors
+    closer than min_color_gap keeps the shading as fewer, clearly different steps.
+
+    The same bias means a small but distinctive area (a pink nose, green eyes) can end up with no
+    color close to it. Each rescue finds the largest connected patch that every palette color matches
+    badly and gives it its own color, merging the two most similar colors if the palette is full.
     """
     h, w = rgb.shape[:2]
     lab = to_lab(rgb).reshape(-1, 3)
@@ -84,8 +101,18 @@ def quantize(rgb: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray]:
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
     _, _, centers = cv2.kmeans(sample, p.n_colors, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
 
+    labels, _ = assign(lab, centers)
+    counts = np.bincount(labels, minlength=len(centers)).astype(np.float32)
+    frozen = np.zeros(len(centers), dtype=bool)
+    while len(centers) > 2:
+        merged, merged_counts, merged_frozen, gap = merge_closest_pair(centers.copy(), counts.copy(), frozen)
+        if gap >= p.min_color_gap:
+            break
+        centers, counts, frozen = merged, merged_counts, merged_frozen
+
     rescue_area = p.rescue_min_frac * h * w
-    rescued: list[int] = []
+    # A rescued color must be new, not a mid-tone the spacing step just merged away.
+    distinct = max(p.rescue_delta_e, p.min_color_gap)
     for _ in range(p.rescue_colors):
         labels, err = assign(lab, centers)
         patches, _ = ndimage.label((err > p.rescue_delta_e).reshape(h, w))
@@ -97,19 +124,17 @@ def quantize(rgb: np.ndarray, p: Params) -> tuple[np.ndarray, np.ndarray]:
                 break
             mean = lab[patches.ravel() == candidate].mean(axis=0)
             # Skip a patch whose average is already in the palette; only its spread is off.
-            if np.linalg.norm(centers - mean, axis=1).min() >= p.rescue_delta_e:
+            if np.linalg.norm(centers - mean, axis=1).min() >= distinct:
                 color = mean
                 break
         if color is None:
             break
         counts = np.bincount(labels, minlength=len(centers)).astype(np.float32)
-        gaps = np.linalg.norm(centers[:, None] - centers[None], axis=2)
-        np.fill_diagonal(gaps, np.inf)
-        gaps[rescued, :] = gaps[:, rescued] = np.inf  # never merge away a color we just rescued
-        i, j = np.unravel_index(gaps.argmin(), gaps.shape)
-        centers[i] = (centers[i] * counts[i] + centers[j] * counts[j]) / max(counts[i] + counts[j], 1)
-        centers[j] = color
-        rescued.append(int(j))
+        if len(centers) >= p.n_colors:
+            # Never merge away a color we just rescued.
+            centers, counts, frozen, _ = merge_closest_pair(centers, counts, frozen)
+        centers = np.vstack([centers, color[None]]).astype(np.float32)
+        frozen = np.append(frozen, True)
 
     labels, _ = assign(lab, centers)
     return lab_to_rgb(centers), labels.reshape(h, w)

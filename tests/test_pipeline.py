@@ -20,12 +20,25 @@ def nearest_delta_e(palette: np.ndarray, rgb: tuple[int, int, int]) -> float:
 def test_rescue_adds_a_small_distinctive_color() -> None:
     pink = (200, 150, 150)  # like a cat's nose against warm fur
     rgb = gradient_with_patch(pink, slice(90, 102))  # 144 px, ~0.4% of the image
-    without, _ = P.quantize(rgb, P.Params(n_colors=8, rescue_colors=0))
-    with_rescue, labels = P.quantize(rgb, P.Params(n_colors=8))
+    without, _ = P.quantize(rgb, P.Params(n_colors=8, min_color_gap=0, rescue_colors=0))
+    with_rescue, labels = P.quantize(rgb, P.Params(n_colors=8, min_color_gap=0))
     assert nearest_delta_e(without, pink) > 20  # plain K-means spends every color on the gradient
     assert nearest_delta_e(with_rescue, pink) < 5
     assert len(with_rescue) == 8
     assert len(np.unique(labels[90:102, 90:102])) == 1
+
+
+def test_gradient_colors_are_spaced_apart() -> None:
+    rgb = gradient_with_patch((0, 0, 0), slice(0, 0))  # plain gradient
+    crowded, _ = P.quantize(rgb, P.Params(n_colors=16, min_color_gap=0, rescue_colors=0))
+    spaced, labels = P.quantize(rgb, P.Params(n_colors=16, min_color_gap=10, rescue_colors=0))
+    gaps = np.linalg.norm(P.palette_lab(spaced)[:, None] - P.palette_lab(spaced)[None], axis=2)
+    np.fill_diagonal(gaps, np.inf)
+    assert gaps.min() >= 10
+    assert len(spaced) < len(crowded)
+    # Still a ramp: colors step monotonically from dark to light.
+    lightness = P.palette_lab(spaced)[labels[0], 0]
+    assert (np.diff(lightness) >= 0).all()
 
 
 def test_rescue_does_not_duplicate_colors() -> None:
